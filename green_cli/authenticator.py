@@ -157,7 +157,8 @@ class HardwareDevice(Authenticator):
 
     @property
     def hw_device(self):
-        return json.dumps({'device': {'name': self.name}})
+        return json.dumps({'device': {'name': self.name, 'supports_liquid': 1,
+            'supports_low_r': True, 'supports_arbitrary_scripts': True}})
 
     @property
     def mnemonic(self):
@@ -193,7 +194,31 @@ class HardwareDevice(Authenticator):
             return result
         if details['action'] == 'sign_tx':
             return self.sign_tx(details)
-        raise NotImplementedError("action = \"{}\"".format(details['action']))
+        if details['action'] == 'get_receive_address':
+            blinding_script_hash = bytes.fromhex(details['address']['blinding_script_hash'])
+            public_blinding_key = self.get_public_blinding_key(blinding_script_hash)
+            return json.dumps({'blinding_key': public_blinding_key.hex()})
+
+        retval = {}
+        if details['action'] == 'create_transaction':
+            blinding_keys = {}
+            change_addresses = details['transaction'].get('change_address', {})
+            for asset, addr in change_addresses.items():
+                blinding_script_hash = bytes.fromhex(addr['blinding_script_hash'])
+                blinding_keys[asset] = self.get_public_blinding_key(blinding_script_hash).hex()
+            retval['blinding_keys'] = blinding_keys
+        if 'blinded_scripts' in details:
+            nonces = []
+            for elem in details['blinded_scripts']:
+                pubkey = bytes.fromhex(elem['pubkey'])
+                script = bytes.fromhex(elem['script'])
+                nonces.append(self.get_shared_nonce(pubkey, script).hex())
+            retval['nonces'] = nonces
+
+        if not retval:
+            raise NotImplementedError("action = \"{}\"".format(details['action']))
+
+        return json.dumps(retval)
 
 
 class WallyAuthenticator(MnemonicOnDisk, HardwareDevice):
@@ -215,9 +240,13 @@ class WallyAuthenticator(MnemonicOnDisk, HardwareDevice):
         return self.register(session_obj)
 
     @property
-    def master_key(self):
+    def seed(self):
         _, seed = wally.bip39_mnemonic_to_seed512(self._mnemonic, None)
-        return wally.bip32_key_from_seed(seed, wally.BIP32_VER_TEST_PRIVATE,
+        return seed
+
+    @property
+    def master_key(self):
+        return wally.bip32_key_from_seed(self.seed, wally.BIP32_VER_TEST_PRIVATE,
                                          wally.BIP32_FLAG_KEY_PRIVATE)
 
     def derive_key(self, path: List[int]):
@@ -242,20 +271,78 @@ class WallyAuthenticator(MnemonicOnDisk, HardwareDevice):
         return wally.ec_sig_to_der(signature)
 
     def sign_tx(self, details):
-        txdetails = details['transaction']
+        retval = {}
 
+        txdetails = details['transaction']
         utxos = txdetails['used_utxos'] or txdetails['old_used_utxos']
+
+        # FIXME: hack...
+        is_liquid = 'confidential' in utxos[0]
+        if is_liquid:
+            # FIXME: I don't think we handle mixed confidential and non-confidential utxos in
+            # general
+            assert all([utxo['confidential'] for utxo in utxos])
+
+        tx_flags = wally.WALLY_TX_FLAG_USE_WITNESS
+        if is_liquid:
+            tx_flags |= wally.WALLY_TX_FLAG_USE_ELEMENTS
+        wally_tx = wally.tx_from_hex(txdetails['transaction'], tx_flags)
+
+        if is_liquid:
+            for i, o in enumerate(details['transaction_outputs']):
+                o['wally_index'] = i
+
+            blinded_outputs = [o for o in details['transaction_outputs'] if not o['is_fee']]
+            for output in blinded_outputs:
+                # TODO: the derivation dance
+                output['abf'] = os.urandom(32).hex()
+                output['vbf'] = os.urandom(32).hex()
+
+            endpoints = utxos + blinded_outputs
+            values = [endpoint['satoshi'] for endpoint in endpoints]
+            abfs = ''.join([endpoint['abf'] for endpoint in endpoints])
+            vbfs = ''.join([endpoint['vbf'] for endpoint in endpoints[:-1]])
+            final_vbf = wally.asset_final_vbf(values, len(utxos), bytes.fromhex(abfs), bytes.fromhex(vbfs))
+            blinded_outputs[-1]['vbf'] = final_vbf.hex()
+
+            for o in blinded_outputs:
+                asset_commitment = wally.asset_generator_from_bytes(bytes.fromhex(o['asset_id'])[::-1], bytes.fromhex(o['abf']))
+                value_commitment = wally.asset_value_commitment(o['satoshi'], bytes.fromhex(o['vbf']), asset_commitment)
+
+                o['asset_commitment'] = asset_commitment.hex()
+                o['value_commitment'] = value_commitment.hex()
+
+                # Required for the signature to be valid
+                wally.tx_set_output_asset(wally_tx, o['wally_index'], asset_commitment)
+                wally.tx_set_output_value(wally_tx, o['wally_index'], value_commitment)
+
+            for key in ['abfs', 'vbfs', 'asset_commitments', 'value_commitments']:
+                # gdk expects to get an empty entry for the fee outputs too
+                retval[key] = [o.get(key[:-1], '') for o in details['transaction_outputs']]
+
         signatures = []
         for index, utxo in enumerate(utxos):
-            wally_tx = wally.tx_from_hex(txdetails['transaction'], wally.WALLY_TX_FLAG_USE_WITNESS)
+
             is_segwit = utxo['script_type'] in [14, 15, 159, 162] # FIXME!!
             if not is_segwit:
                 # FIXME
                 raise NotImplementedError("Non-segwit input")
             flags = wally.WALLY_TX_FLAG_USE_WITNESS if is_segwit else 0
             prevout_script = wally.hex_to_bytes(utxo['prevout_script'])
-            txhash = wally.tx_get_btc_signature_hash(
-                wally_tx, index, prevout_script, utxo['satoshi'], wally.WALLY_SIGHASH_ALL, flags)
+
+            is_liquid = 'confidential' in utxo
+            if is_liquid:
+                get_sig_hash = wally.tx_get_elements_signature_hash
+                if utxo['confidential']:
+                    value = bytes.fromhex(utxo['commitment'])
+                else:
+                    value = wally.tx_confidential_value_from_satoshi(utxo['satoshi'])
+            else:
+                get_sig_hash = wally.tx_get_btc_signature_hash
+                value = utxo['satoshi']
+
+            txhash = get_sig_hash(
+                wally_tx, index, prevout_script, value, wally.WALLY_SIGHASH_ALL, flags)
 
             path = utxo['user_path']
             privkey = self.get_privkey(path)
@@ -265,9 +352,25 @@ class WallyAuthenticator(MnemonicOnDisk, HardwareDevice):
             signature.append(wally.WALLY_SIGHASH_ALL)
             signatures.append(wally.hex_from_bytes(signature))
             logging.debug('Signature (der) input %s path %s: %s', index, path, signature)
+        retval['signatures'] = signatures
 
-        return json.dumps({'signatures': signatures})
+        return json.dumps(retval)
 
+    @property
+    def master_blinding_key(self) -> bytes:
+        return wally.asset_blinding_key_from_seed(self.seed)
+
+    def get_private_blinding_key(self, script: bytes) -> bytes:
+        return wally.asset_blinding_key_to_ec_private_key(self.master_blinding_key, script)
+
+    def get_public_blinding_key(self, script: bytes) -> bytes:
+        private_key = self.get_private_blinding_key(script)
+        return wally.ec_public_key_from_private_key(private_key)
+
+    def get_shared_nonce(self, pubkey: bytes, script: bytes) -> bytes:
+        our_privkey = self.get_private_blinding_key(script)
+        nonce = wally.sha256(wally.ecdh(pubkey, our_privkey))
+        return nonce
 
 class HWIDevice(HardwareDevice):
 
